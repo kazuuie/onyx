@@ -65,7 +65,7 @@ def gitlab_doc_sync(
     # Get all repositories from gitlab API
     logger.info("Fetching all repositories from gitlab API")
     try:
-        repos = gitlab_connector.fetch_configured_repos()
+        project = gitlab_connector.fetch_configured_repos()
 
         logger.info(f"Found {len(repos)} repositories to check")
     except Exception as e:
