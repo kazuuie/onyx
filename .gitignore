@@ -59,3 +59,6 @@ node_modules
 
 # plans
 plans/
+
+# build
+build/
