@@ -168,6 +168,25 @@ class GitlabConnector(LoadConnector, PollConnector):
         self.gitlab_client = gitlab.Gitlab(credentials["gitlab_url"], private_token=credentials["gitlab_access_token"])
         return None
 
+    def _fetch_configured_projects(self) -> list[Project]:
+        """
+        設定された owner/name に基づいて GitLab Project オブジェクトのリストを返します。
+        """
+        if not self.gitlab_client:
+            return []
+
+        # 既存の _fetch_from_gitlab 内のロジックを流用
+        if self.project_name:
+            return [self.gitlab_client.projects.get(f"{self.project_owner}/{self.project_name}")]
+        else:
+            # ownerがユーザーかグループかによって取得方法を分ける
+            try:
+                group = self.gitlab_client.groups.get(self.project_owner)
+                return group.projects.list(get_all=True)
+            except:
+                user = self.gitlab_client.users.get(self.project_owner)
+                return user.projects.list(get_all=True)
+
     def _fetch_from_gitlab(self, start: datetime | None = None, end: datetime | None = None) -> GenerateDocumentsOutput:
         if self.gitlab_client is None:
             raise ConnectorMissingCredentialError("Gitlab")
