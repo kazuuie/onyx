@@ -4,7 +4,7 @@ from gitlab import Repository
 
 from ee.onyx.db.external_perm import ExternalUserGroup
 from ee.onyx.external_permissions.gitlab.utils import get_external_user_group
-from onyx.connectors.gitlab.connector import gitlabConnector
+from onyx.connectors.gitlab.connector import GitlabConnector
 from onyx.db.models import ConnectorCredentialPair
 from onyx.utils.logger import setup_logger
 
@@ -15,7 +15,7 @@ def gitlab_group_sync(
     tenant_id: str,  # noqa: ARG001
     cc_pair: ConnectorCredentialPair,
 ) -> Generator[ExternalUserGroup, None, None]:
-    gitlab_connector: gitlabConnector = gitlabConnector(
+    gitlab_connector: GitlabConnector = GitlabConnector(
         **cc_pair.connector.connector_specific_config
     )
     credential_json = (
