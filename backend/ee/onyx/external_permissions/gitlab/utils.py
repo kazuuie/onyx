@@ -13,7 +13,7 @@ from onyx.utils.logger import setup_logger
 logger = setup_logger()
 
 
-class gitlabVisibility(Enum):
+class GitLabVisibility(Enum):
     """gitlab repository visibility options."""
 
     PUBLIC = "public"
@@ -42,471 +42,95 @@ def _run_with_retry(
     return None
 
 
-def get_project_visibility(project: Project) -> gitlabVisibility:
+def get_project_visibility(project: Project) -> GitLabVisibility:
     visibility = project.visibility
     if visibility == "public":
-        return gitlabVisibility.PUBLIC
+        return GitLabVisibility.PUBLIC
     if visibility == "internal":
-        return gitlabVisibility.INTERNAL
-    return gitlabVisibility.PRIVATE
+        return GitLabVisibility.INTERNAL
+    return GitLabVisibility.PRIVATE
 
 
-def _fetch_project_members(project: Project) -> list[str]:
-    """プロジェクトに直接属するメンバーのメールアドレスを取得"""
-    members = project.members.list(get_all=True)
-    emails = []
-    for m in members:
-        # GitLab APIのUserオブジェクトからメールを取得するには十分な権限が必要
-        # 取得できない場合はusername等で代替するか、管理APIを利用する設計が必要
-        user = getattr(m, "email", None)
-        if user:
-            emails.append(user)
-    return emails
-
-
-def get_external_access_permission(project: Project, gitlab_client: gitlab.Gitlab) -> ExternalAccess:
+def get_external_access_permission(project: Project, gitlab_client: gitlab.Gitlab, add_prefix: bool = False) -> ExternalAccess:
     """
     GitLabプロジェクトの権限情報をOnyxのExternalAccess形式に変換します。
     """
     project_visibility = get_project_visibility(project)
 
-    if project_visibility == gitlabVisibility.PUBLIC:
-        return ExternalAccess(external_user_emails=[], external_user_group_ids=[])
+    if project_visibility == GitLabVisibility.PUBLIC or project_visibility == GitLabVisibility.INTERNAL:
+        return ExternalAccess(
+            external_user_emails=set(),
+            external_user_group_ids=set(),
+            is_public=True,
+        )
 
-    external_user_groups: list[ExternalUserGroup] = []
+    group_ids: set[str] = set()
+    # 1. プロジェクト固有のグループID (直接メンバー用)
+    project_group_id = f"project_{project.id}_members"
+    if add_prefix:
+        project_group_id = build_ext_group_name_for_onyx(source=DocumentSource.GITLAB, ext_group_name=project_group_id)
 
-    # 1. プロジェクト直接のメンバーをグループとして扱う
-    project_member_emails = _fetch_project_members(project)
-    if project_member_emails:
-        group_id = build_ext_group_name_for_onyx(source=DocumentSource.GITLAB, ext_group_name=f"project_{project.id}_members")
-        external_user_groups.append(ExternalUserGroup(id=group_id, user_emails=project_member_emails))
+    group_ids.add(project_group_id)
 
-    # 2. プロジェクトが属するグループ（および親グループ）のメンバー取得
+    # 2. 親グループ (Namespace) のグループID
+    # GitLabプロジェクトがグループに属している場合、そのグループIDも追加する
     if project.namespace["kind"] == "group":
-        group = gitlab_client.groups.get(project.namespace["id"])
-        # グループメンバー（継承含む）を取得
-        group_members = group.members_all.list(get_all=True)
-        group_emails = [getattr(m, "email", None) for m in group_members if getattr(m, "email", None)]
+        try:
+            # ここで gitlab_client を使用してグループ詳細を取得する
+            group_obj = _run_with_retry(
+                lambda: gitlab_client.groups.get(project.namespace["id"]), f"fetch group {project.namespace['id']}"
+            )
+            # 親グループ、さらにその親（先祖）すべてのグループIDを収集
+            # ※GitLabは階層構造のため、上位グループのメンバーも閲覧権限がある
+            ns_group_id = f"group_{group_obj.id}"
+            if add_prefix:
+                ns_group_id = build_ext_group_name_for_onyx(source=DocumentSource.GITLAB, ext_group_name=ns_group_id)
+            group_ids.add(ns_group_id)
 
-        if group_emails:
-            group_id = build_ext_group_name_for_onyx(source=DocumentSource.GITLAB, ext_group_name=f"group_{group.id}_members")
-            external_user_groups.append(ExternalUserGroup(id=group_id, user_emails=group_emails))
+        except Exception as e:
+            logger.error(f"Failed to fetch group info for namespace {project.namespace['id']}: {e}")
 
     return ExternalAccess(
-        external_user_emails=[],  # 個別メールではなくグループ管理を推奨
-        external_user_group_ids=[g.id for g in external_user_groups],
+        external_user_emails=set(),
+        external_user_group_ids=group_ids,
+        is_public=False,
     )
 
 
-# Higher-order function to wrap gitlab operations with retry and exception handling
-
-
-# def _run_with_retry(
-#     operation: Callable[[], T],
-#     description: str,
-#     gitlab_client: gitlab,
-#     retry_count: int = 0,
-# ) -> Optional[T]:
-#     """Execute a gitlab operation with retry on rate limit and exception handling."""
-#     logger.debug(f"Starting operation '{description}', attempt {retry_count + 1}")
-#     try:
-#         result = operation()
-#         logger.debug(f"Operation '{description}' completed successfully")
-#         return result
-#     except RateLimitExceededException:
-#         if retry_count < MAX_RETRY_COUNT:
-#             sleep_after_rate_limit_exception(gitlab_client)
-#             logger.warning(f"Rate limit exceeded while {description}. Retrying... (attempt {retry_count + 1}/{MAX_RETRY_COUNT})")
-#             return _run_with_retry(operation, description, gitlab_client, retry_count + 1)
-#         else:
-#             error_msg = f"Max retries exceeded for {description}"
-#             logger.exception(error_msg)
-#             raise RuntimeError(error_msg)
-#     except gitlabException as e:
-#         logger.warning(f"gitlab API error during {description}: {e}")
-#         return None
-#     except Exception as e:
-#         logger.exception(f"Unexpected error during {description}: {e}")
-#         return None
-
-
-# class UserInfo(BaseModel):
-#     """Represents a gitlab user with their basic information."""
-
-#     login: str
-#     name: Optional[str] = None
-#     email: Optional[str] = None
-
-
-# class TeamInfo(BaseModel):
-#     """Represents a gitlab team with its members."""
-
-#     name: str
-#     slug: str
-#     members: List[UserInfo]
-
-
-# def _fetch_organization_members(
-#     gitlab_client: gitlab,
-#     org_name: str,
-#     retry_count: int = 0,  # noqa: ARG001
-# ) -> List[UserInfo]:
-#     """Fetch all organization members including owners and regular members."""
-#     org_members: List[UserInfo] = []
-#     logger.info(f"Fetching organization members for {org_name}")
-
-#     org = _run_with_retry(
-#         lambda: gitlab_client.get_organization(org_name),
-#         f"get organization {org_name}",
-#         gitlab_client,
-#     )
-#     if not org:
-#         logger.error(f"Failed to fetch organization {org_name}")
-#         raise RuntimeError(f"Failed to fetch organization {org_name}")
-
-#     member_objs: PaginatedList[NamedUser] | list[NamedUser] = (
-#         _run_with_retry(
-#             lambda: org.get_members(filter_="all"),
-#             f"get members for organization {org_name}",
-#             gitlab_client,
-#         )
-#         or []
-#     )
-
-#     for member in member_objs:
-#         user_info = UserInfo(login=member.login, name=member.name, email=member.email)
-#         org_members.append(user_info)
-
-#     logger.info(f"Fetched {len(org_members)} members for organization {org_name}")
-#     return org_members
-
-
-# def _fetch_repository_teams_detailed(
-#     repo: Repository,
-#     gitlab_client: gitlab,
-#     retry_count: int = 0,  # noqa: ARG001
-# ) -> List[TeamInfo]:
-#     """Fetch teams with access to the repository and their members."""
-#     teams_data: List[TeamInfo] = []
-#     logger.info(f"Fetching teams for repository {repo.full_name}")
-
-#     team_objs: PaginatedList[Team] | list[Team] = (
-#         _run_with_retry(
-#             lambda: repo.get_teams(),
-#             f"get teams for repository {repo.full_name}",
-#             gitlab_client,
-#         )
-#         or []
-#     )
-
-#     for team in team_objs:
-#         logger.info(f"Processing team {team.name} (slug: {team.slug}) for repository {repo.full_name}")
-
-#         members: PaginatedList[NamedUser] | list[NamedUser] = (
-#             _run_with_retry(
-#                 lambda: team.get_members(),
-#                 f"get members for team {team.name}",
-#                 gitlab_client,
-#             )
-#             or []
-#         )
-
-#         team_members = []
-#         for m in members:
-#             user_info = UserInfo(login=m.login, name=m.name, email=m.email)
-#             team_members.append(user_info)
-
-#         team_info = TeamInfo(name=team.name, slug=team.slug, members=team_members)
-#         teams_data.append(team_info)
-#         logger.info(f"Team {team.name} has {len(team_members)} members")
-
-#     logger.info(f"Fetched {len(teams_data)} teams for repository {repo.full_name}")
-#     return teams_data
-
-
-# def fetch_repository_team_slugs(
-#     repo: Repository,
-#     gitlab_client: gitlab,
-#     retry_count: int = 0,  # noqa: ARG001
-# ) -> List[str]:
-#     """Fetch team slugs with access to the repository."""
-#     logger.info(f"Fetching team slugs for repository {repo.full_name}")
-#     teams_data: List[str] = []
-
-#     team_objs: PaginatedList[Team] | list[Team] = (
-#         _run_with_retry(
-#             lambda: repo.get_teams(),
-#             f"get teams for repository {repo.full_name}",
-#             gitlab_client,
-#         )
-#         or []
-#     )
-
-#     for team in team_objs:
-#         teams_data.append(team.slug)
-
-#     logger.info(f"Fetched {len(teams_data)} team slugs for repository {repo.full_name}")
-#     return teams_data
-
-
-# def _get_collaborators_and_outside_collaborators(
-#     gitlab_client: gitlab,
-#     repo: Repository,
-# ) -> Tuple[List[UserInfo], List[UserInfo]]:
-#     """Fetch and categorize collaborators into regular and outside collaborators."""
-#     collaborators: List[UserInfo] = []
-#     outside_collaborators: List[UserInfo] = []
-#     logger.info(f"Fetching collaborators for repository {repo.full_name}")
-
-#     repo_collaborators: PaginatedList[NamedUser] | list[NamedUser] = (
-#         _run_with_retry(
-#             lambda: repo.get_collaborators(),
-#             f"get collaborators for repository {repo.full_name}",
-#             gitlab_client,
-#         )
-#         or []
-#     )
-
-#     for collaborator in repo_collaborators:
-#         is_outside = False
-
-#         # Check if collaborator is outside the organization
-#         if repo.organization:
-#             org: Organization | None = _run_with_retry(
-#                 lambda: gitlab_client.get_organization(repo.organization.login),
-#                 f"get organization {repo.organization.login}",
-#                 gitlab_client,
-#             )
-
-#             if org is not None:
-#                 org_obj = org
-#                 membership = _run_with_retry(
-#                     lambda: org_obj.has_in_members(collaborator),
-#                     f"check membership for {collaborator.login} in org {org_obj.login}",
-#                     gitlab_client,
-#                 )
-#                 is_outside = membership is not None and not membership
-
-#         info = UserInfo(login=collaborator.login, name=collaborator.name, email=collaborator.email)
-#         if repo.organization and is_outside:
-#             outside_collaborators.append(info)
-#         else:
-#             collaborators.append(info)
-
-#     logger.info(
-#         f"Categorized {len(collaborators)} regular and {len(outside_collaborators)} outside collaborators for {repo.full_name}"
-#     )
-#     return collaborators, outside_collaborators
-
-
-# def form_collaborators_group_id(repository_id: int) -> str:
-#     """Generate group ID for repository collaborators."""
-#     if not repository_id:
-#         logger.exception("Repository ID is required to generate collaborators group ID")
-#         raise ValueError("Repository ID must be set to generate group ID.")
-#     group_id = f"{repository_id}_collaborators"
-#     return group_id
-
-
-# def form_organization_group_id(organization_id: int) -> str:
-#     """Generate group ID for organization using organization ID."""
-#     if not organization_id:
-#         logger.exception("Organization ID is required to generate organization group ID")
-#         raise ValueError("Organization ID must be set to generate group ID.")
-#     group_id = f"{organization_id}_organization"
-#     return group_id
-
-
-# def form_outside_collaborators_group_id(repository_id: int) -> str:
-#     """Generate group ID for outside collaborators."""
-#     if not repository_id:
-#         logger.exception("Repository ID is required to generate outside collaborators group ID")
-#         raise ValueError("Repository ID must be set to generate group ID.")
-#     group_id = f"{repository_id}_outside_collaborators"
-#     return group_id
-
-
-# def get_repository_visibility(repo: Repository) -> gitlabVisibility:
-#     """
-#     Get the visibility of a repository.
-#     Returns gitlabVisibility enum member.
-#     """
-#     if hasattr(repo, "visibility"):
-#         visibility = repo.visibility
-#         logger.info(f"Repository {repo.full_name} visibility from attribute: {visibility}")
-#         try:
-#             return gitlabVisibility(visibility)
-#         except ValueError:
-#             logger.warning(f"Unknown visibility '{visibility}' for repo {repo.full_name}, defaulting to private")
-#             return gitlabVisibility.PRIVATE
-
-#     logger.info(f"Repository {repo.full_name} is private")
-#     return gitlabVisibility.PRIVATE
-
-
-# def get_external_access_permission(repo: Repository, gitlab_client: gitlab, add_prefix: bool = False) -> ExternalAccess:
-#     """
-#     Get the external access permission for a repository.
-#     Uses group-based permissions for efficiency and scalability.
-
-#     add_prefix: When this method is called during the initial permission sync via the connector,
-#                 the group ID isn't prefixed with the source while inserting the document record.
-#                 So in that case, set add_prefix to True, allowing the method itself to handle
-#                 prefixing. However, when the same method is invoked from doc_sync, our system
-#                 already adds the prefix to the group ID while processing the ExternalAccess object.
-#     """
-#     # We maintain collaborators, and outside collaborators as two separate groups
-#     # instead of adding individual user emails to ExternalAccess.external_user_emails for two reasons:
-#     # 1. Changes in repo collaborators (additions/removals) would require updating all documents.
-#     # 2. Repo permissions can change without updating the repo's updated_at timestamp,
-#     #    forcing full permission syncs for all documents every time, which is inefficient.
-
-#     repo_visibility = get_repository_visibility(repo)
-#     logger.info(f"Generating ExternalAccess for {repo.full_name}: visibility={repo_visibility.value}")
-
-#     if repo_visibility == gitlabVisibility.PUBLIC:
-#         logger.info(f"Repository {repo.full_name} is public - allowing access to all users")
-#         return ExternalAccess(
-#             external_user_emails=set(),
-#             external_user_group_ids=set(),
-#             is_public=True,
-#         )
-#     elif repo_visibility == gitlabVisibility.PRIVATE:
-#         logger.info(f"Repository {repo.full_name} is private - setting up restricted access")
-
-#         collaborators_group_id = form_collaborators_group_id(repo.id)
-#         outside_collaborators_group_id = form_outside_collaborators_group_id(repo.id)
-#         if add_prefix:
-#             collaborators_group_id = build_ext_group_name_for_onyx(
-#                 source=DocumentSource.gitlab,
-#                 ext_group_name=collaborators_group_id,
-#             )
-#             outside_collaborators_group_id = build_ext_group_name_for_onyx(
-#                 source=DocumentSource.gitlab,
-#                 ext_group_name=outside_collaborators_group_id,
-#             )
-#         group_ids = {collaborators_group_id, outside_collaborators_group_id}
-
-#         team_slugs = fetch_repository_team_slugs(repo, gitlab_client)
-#         if add_prefix:
-#             team_slugs = [
-#                 build_ext_group_name_for_onyx(
-#                     source=DocumentSource.gitlab,
-#                     ext_group_name=slug,
-#                 )
-#                 for slug in team_slugs
-#             ]
-#         group_ids.update(team_slugs)
-
-#         logger.info(f"ExternalAccess groups for {repo.full_name}: {group_ids}")
-#         return ExternalAccess(
-#             external_user_emails=set(),
-#             external_user_group_ids=group_ids,
-#             is_public=False,
-#         )
-#     else:
-#         # Internal repositories - accessible to organization members
-#         logger.info(f"Repository {repo.full_name} is internal - accessible to org members")
-#         org_group_id = form_organization_group_id(repo.organization.id)
-#         if add_prefix:
-#             org_group_id = build_ext_group_name_for_onyx(
-#                 source=DocumentSource.gitlab,
-#                 ext_group_name=org_group_id,
-#             )
-#         group_ids = {org_group_id}
-#         logger.info(f"ExternalAccess groups for {repo.full_name}: {group_ids}")
-#         return ExternalAccess(
-#             external_user_emails=set(),
-#             external_user_group_ids=group_ids,
-#             is_public=False,
-#         )
-
-
-# def get_external_user_group(repo: Repository, gitlab_client: gitlab) -> list[ExternalUserGroup]:
-#     """
-#     Get the external user group for a repository.
-#     Creates ExternalUserGroup objects with actual user emails for each permission group.
-#     """
-#     repo_visibility = get_repository_visibility(repo)
-#     logger.info(f"Generating ExternalUserGroups for {repo.full_name}: visibility={repo_visibility.value}")
-
-#     if repo_visibility == gitlabVisibility.PRIVATE:
-#         logger.info(f"Processing private repository {repo.full_name}")
-
-#         collaborators, outside_collaborators = _get_collaborators_and_outside_collaborators(gitlab_client, repo)
-#         teams = _fetch_repository_teams_detailed(repo, gitlab_client)
-#         external_user_groups = []
-
-#         user_emails = set()
-#         for collab in collaborators:
-#             if collab.email:
-#                 user_emails.add(collab.email)
-#             else:
-#                 logger.error(f"Collaborator {collab.login} has no email")
-
-#         if user_emails:
-#             collaborators_group = ExternalUserGroup(
-#                 id=form_collaborators_group_id(repo.id),
-#                 user_emails=list(user_emails),
-#             )
-#             external_user_groups.append(collaborators_group)
-#             logger.info(f"Created collaborators group with {len(user_emails)} emails")
-
-#         # Create group for outside collaborators
-#         user_emails = set()
-#         for collab in outside_collaborators:
-#             if collab.email:
-#                 user_emails.add(collab.email)
-#             else:
-#                 logger.error(f"Outside collaborator {collab.login} has no email")
-
-#         if user_emails:
-#             outside_collaborators_group = ExternalUserGroup(
-#                 id=form_outside_collaborators_group_id(repo.id),
-#                 user_emails=list(user_emails),
-#             )
-#             external_user_groups.append(outside_collaborators_group)
-#             logger.info(f"Created outside collaborators group with {len(user_emails)} emails")
-
-#         # Create groups for teams
-#         for team in teams:
-#             user_emails = set()
-#             for member in team.members:
-#                 if member.email:
-#                     user_emails.add(member.email)
-#                 else:
-#                     logger.error(f"Team member {member.login} has no email")
-
-#             if user_emails:
-#                 team_group = ExternalUserGroup(
-#                     id=team.slug,
-#                     user_emails=list(user_emails),
-#                 )
-#                 external_user_groups.append(team_group)
-#                 logger.info(f"Created team group {team.name} with {len(user_emails)} emails")
-
-#         logger.info(f"Created {len(external_user_groups)} ExternalUserGroups for private repository {repo.full_name}")
-#         return external_user_groups
-
-#     if repo_visibility == gitlabVisibility.INTERNAL:
-#         logger.info(f"Processing internal repository {repo.full_name}")
-
-#         org_group_id = form_organization_group_id(repo.organization.id)
-#         org_members = _fetch_organization_members(gitlab_client, repo.organization.login)
-
-#         user_emails = set()
-#         for member in org_members:
-#             if member.email:
-#                 user_emails.add(member.email)
-#             else:
-#                 logger.error(f"Org member {member.login} has no email")
-
-#         org_group = ExternalUserGroup(
-#             id=org_group_id,
-#             user_emails=list(user_emails),
-#         )
-#         logger.info(f"Created organization group with {len(user_emails)} emails for internal repository {repo.full_name}")
-#         return [org_group]
-
-#     logger.info(f"Repository {repo.full_name} is public - no user groups needed")
-#     return []
+def get_project_members_emails(project: Project) -> list[str]:
+    """
+    プロジェクトにアクセス可能な全ユーザーのメールアドレスを取得。
+    members_all.list(all=True) を使うことで、継承された権限もカバーする。
+    """
+    # read_api 権限が強ければ、ここで全メンバーのリストが取得可能
+    members = project.members_all.list(get_all=True)
+    emails: set[str] = set()
+
+    for m in members:
+        # 1. 直接的な email 属性（Admin/本人なら見える）
+        # 2. public_email（ユーザーが公開設定にしている場合）
+        email = getattr(m, "email", None) or getattr(m, "public_email", None)
+
+        if email:
+            emails.add(email)
+        else:
+            # フォールバック: username が判明しているなら、
+            # Onyx側のユーザー管理ルールに合わせて生成するか、警告を出す
+            logger.warning(f"User {m.username} (ID: {m.id}) has no email visible. Sync might fail for this user.")
+
+    return list(emails)
+
+
+def get_external_user_groups(project: Project) -> list[ExternalUserGroup]:
+    """
+    Onyxの Permission Sync で使用。
+    'project_{id}_members' という Onyx 内のグループに誰が属するかを定義。
+    """
+    emails = _run_with_retry(lambda: get_project_members_emails(project), f"fetching members for project {project.id}")
+    if not emails:
+        return []
+
+    # Onyxが認識できるグループIDの形式に変換
+    group_name = f"project_{project.id}_members"
+
+    return [ExternalUserGroup(id=group_name, user_emails=emails)]

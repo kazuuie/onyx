@@ -73,18 +73,6 @@ def _convert_merge_request_to_document(mr: Any) -> Document:
 
 
 def _convert_issue_to_document(issue: Any, project: Project) -> Document:
-    # return Document(
-    #     id=issue.web_url,
-    #     sections=[TextSection(link=issue.web_url, text=issue.description or "")],
-    #     source=DocumentSource.GITLAB,
-    #     semantic_identifier=issue.title,
-    #     # updated_at is UTC time but is timezone unaware, explicitly add UTC
-    #     # as there is logic in indexing to prevent wrong timestamped docs
-    #     # due to local time discrepancies with UTC
-    #     doc_updated_at=issue.updated_at.replace(tzinfo=timezone.utc),
-    #     primary_owners=[get_author(issue.author)],
-    #     metadata={"state": issue.state, "type": issue.type if issue.type else "Issue"},
-    # )
     return Document(
         id=f"gitlab_issue_{project.id}_{issue.iid}",
         sections=[TextSection(text=issue.description or "", link=issue.web_url)],
@@ -183,7 +171,7 @@ class GitlabConnector(LoadConnector, PollConnector):
             try:
                 group = self.gitlab_client.groups.get(self.project_owner)
                 return group.projects.list(get_all=True)
-            except:
+            except gitlab.exceptions.GitlabError:
                 user = self.gitlab_client.users.get(self.project_owner)
                 return user.projects.list(get_all=True)
 
