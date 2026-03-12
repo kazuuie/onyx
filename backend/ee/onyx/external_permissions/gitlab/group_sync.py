@@ -10,6 +10,14 @@ from onyx.utils.logger import setup_logger
 logger = setup_logger()
 
 
+def build_user_email_cache(gitlab_client) -> dict[int, str]:
+    cache = {}
+    all_users = gitlab_client.users.list(get_all=True)
+    for user in all_users:
+        cache[user.id] = getattr(user, "email", None) or getattr(user, "public_email", "")
+    return cache
+
+
 def gitlab_group_sync(
     tenant_id: str,  # noqa: ARG001
     cc_pair: ConnectorCredentialPair,
@@ -25,6 +33,13 @@ def gitlab_group_sync(
         raise ValueError("gitlab_client is required")
 
     logger.info("Starting GitLab group sync...")
+
+    try:
+        user_email_cache = build_user_email_cache(gitlab_connector.gitlab_client)
+        logger.info(f"Successfully built user email cache for {len(user_email_cache)} users.")
+    except Exception as e:
+        logger.error(f"Failed to build user email cache: {e}")
+        user_email_cache = {}
 
     # 3. Fetch configured projects based on the provided owner/repository settings
     try:

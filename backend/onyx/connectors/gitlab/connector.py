@@ -52,7 +52,11 @@ def get_author(author: Any) -> BasicExpertInfo:
     )
 
 
-def _convert_merge_request_to_document(mr: Any) -> Document:
+def _convert_merge_request_to_document(
+    mr: Any,
+    project: Project,
+    add_prefix: bool = True,
+) -> Document:
     doc = Document(
         id=mr.web_url,
         sections=[TextSection(link=mr.web_url, text=mr.description or "")],
@@ -64,20 +68,34 @@ def _convert_merge_request_to_document(mr: Any) -> Document:
         doc_updated_at=mr.updated_at.replace(tzinfo=timezone.utc),
         primary_owners=[get_author(mr.author)],
         metadata={"state": mr.state, "type": "MergeRequest"},
+        external_access=get_external_access_permission(project=project, add_prefix=add_prefix),
     )
     return doc
 
 
-def _convert_issue_to_document(issue: Any, project: Project) -> Document:
+def _convert_issue_to_document(
+    issue: Any,
+    project: Project,
+    add_prefix: bool = True,
+) -> Document:
+
     return Document(
-        id=f"gitlab_issue_{project.id}_{issue.iid}",
-        sections=[TextSection(text=issue.description or "", link=issue.web_url)],
+        id=issue.web_url,
+        sections=[TextSection(link=issue.web_url, text=issue.description or "")],
+        semantic_identifier=issue.title,
+        # updated_at is UTC time but is timezone unaware, explicitly add UTC
+        # as there is logic in indexing to prevent wrong timestamped docs
+        # due to local time discrepancies with UTC
+        doc_updated_at=issue.updated_at.replace(tzinfo=timezone.utc),
+        primary_owners=[get_author(issue.author)],
         source=DocumentSource.GITLAB,
+        external_access=get_external_access_permission(project=project, add_prefix=add_prefix),
         metadata={
             "connector_id": "gitlab",
             "repo": project.path_with_namespace,
             "project_id": project.id,
-            "type": "issue",
+            "type": issue.type if issue.type else "Issue",
+            "state": issue.state,
         },
     )
 
@@ -95,16 +113,14 @@ def _convert_code_to_document(
     except UnicodeDecodeError:
         file_content = file_content_obj.decode().decode("latin-1")
 
-    external_access = get_external_access_permission(project=project, add_prefix=add_prefix)
-
     return Document(
-        id=f"gitlab_{project.id}_{file['path']}",
+        id=file["id"],
         sections=[TextSection(text=file_content, link=f"{project.web_url}/-/blob/{default_branch}/{file['path']}")],
         source=DocumentSource.GITLAB,
         semantic_identifier=file["name"],
         metadata={"repo": project.path_with_namespace, "project_id": project.id, "type": "CodeFile"},
-        external_access=external_access,
-        doc_updated_at=datetime.now(timezone.utc),
+        external_access=get_external_access_permission(project=project, add_prefix=add_prefix),
+        doc_updated_at=datetime.now().replace(tzinfo=timezone.utc),
     )
 
 
@@ -154,75 +170,68 @@ class GitlabConnector(LoadConnector, PollConnector):
     def _fetch_from_gitlab(self, start: datetime | None = None, end: datetime | None = None) -> GenerateDocumentsOutput:
         if self.gitlab_client is None:
             raise ConnectorMissingCredentialError("Gitlab")
-        project: Project = self.gitlab_client.projects.get(f"{self.project_owner}/{self.project_name}")
+        projects = self._fetch_configured_projects()
 
-        # Fetch code files
-        if self.include_code_files:
-            # Fetching using BFS as project.report_tree with recursion causing slow load
-            queue = deque([""])  # Start with the root directory
-            while queue:
-                current_path = queue.popleft()
-                files = project.repository_tree(path=current_path, all=True)
-                for file_batch in _batch_gitlab_objects(files, self.batch_size):
-                    code_doc_batch: list[Document | HierarchyNode] = []
-                    for file in file_batch:
-                        if _should_exclude(file["path"]):
-                            continue
+        for project in projects:
+            # Fetch code files
+            if self.include_code_files:
+                # Fetching using BFS as project.report_tree with recursion causing slow load
+                queue = deque([""])  # Start with the root directory
+                while queue:
+                    current_path = queue.popleft()
+                    files = project.repository_tree(path=current_path, all=True)
+                    for file_batch in _batch_gitlab_objects(files, self.batch_size):
+                        code_doc_batch: list[Document | HierarchyNode] = []
+                        for file in file_batch:
+                            if _should_exclude(file["path"]):
+                                continue
 
-                        if file["type"] == "blob":
-                            code_doc_batch.append(
-                                _convert_code_to_document(
-                                    project,
-                                    file,
-                                    self.gitlab_client.url,
-                                    self.project_name,
-                                    self.project_owner,
-                                )
-                            )
-                        elif file["type"] == "tree":
-                            queue.append(file["path"])
+                            if file["type"] == "blob":
+                                code_doc_batch.append(_convert_code_to_document(project, file))
+                            elif file["type"] == "tree":
+                                queue.append(file["path"])
 
-                    if code_doc_batch:
-                        yield code_doc_batch
+                        if code_doc_batch:
+                            yield code_doc_batch
 
-        if self.include_mrs:
-            merge_requests = project.mergerequests.list(
-                state=self.state_filter,
-                order_by="updated_at",
-                sort="desc",
-                iterator=True,
-            )
+            if self.include_mrs:
+                merge_requests = project.mergerequests.list(
+                    state=self.state_filter,
+                    order_by="updated_at",
+                    sort="desc",
+                    iterator=True,
+                )
 
-            for mr_batch in _batch_gitlab_objects(merge_requests, self.batch_size):
-                mr_doc_batch: list[Document | HierarchyNode] = []
-                for mr in mr_batch:
-                    mr.updated_at = datetime.strptime(mr.updated_at, "%Y-%m-%dT%H:%M:%S.%f%z")
-                    if start is not None and mr.updated_at < start.replace(tzinfo=pytz.UTC):
-                        yield mr_doc_batch
-                        return
-                    if end is not None and mr.updated_at > end.replace(tzinfo=pytz.UTC):
-                        continue
-                    mr_doc_batch.append(_convert_merge_request_to_document(mr))
-                yield mr_doc_batch
-
-        if self.include_issues:
-            issues = project.issues.list(state=self.state_filter, iterator=True)
-
-            for issue_batch in _batch_gitlab_objects(issues, self.batch_size):
-                issue_doc_batch: list[Document | HierarchyNode] = []
-                for issue in issue_batch:
-                    issue.updated_at = datetime.strptime(issue.updated_at, "%Y-%m-%dT%H:%M:%S.%f%z")
-                    if start is not None:
-                        start = start.replace(tzinfo=pytz.UTC)
-                        if issue.updated_at < start:
-                            yield issue_doc_batch
+                for mr_batch in _batch_gitlab_objects(merge_requests, self.batch_size):
+                    mr_doc_batch: list[Document | HierarchyNode] = []
+                    for mr in mr_batch:
+                        mr.updated_at = datetime.strptime(mr.updated_at, "%Y-%m-%dT%H:%M:%S.%f%z")
+                        if start is not None and mr.updated_at < start.replace(tzinfo=pytz.UTC):
+                            yield mr_doc_batch
                             return
-                    if end is not None:
-                        end = end.replace(tzinfo=pytz.UTC)
-                        if issue.updated_at > end:
+                        if end is not None and mr.updated_at > end.replace(tzinfo=pytz.UTC):
                             continue
-                    issue_doc_batch.append(_convert_issue_to_document(issue))
-                yield issue_doc_batch
+                        mr_doc_batch.append(_convert_merge_request_to_document(mr, project))
+                    yield mr_doc_batch
+
+            if self.include_issues:
+                issues = project.issues.list(state=self.state_filter, iterator=True)
+
+                for issue_batch in _batch_gitlab_objects(issues, self.batch_size):
+                    issue_doc_batch: list[Document | HierarchyNode] = []
+                    for issue in issue_batch:
+                        issue.updated_at = datetime.strptime(issue.updated_at, "%Y-%m-%dT%H:%M:%S.%f%z")
+                        if start is not None:
+                            start = start.replace(tzinfo=pytz.UTC)
+                            if issue.updated_at < start:
+                                yield issue_doc_batch
+                                return
+                        if end is not None:
+                            end = end.replace(tzinfo=pytz.UTC)
+                            if issue.updated_at > end:
+                                continue
+                        issue_doc_batch.append(_convert_issue_to_document(issue, project))
+                    yield issue_doc_batch
 
     def load_from_state(self) -> GenerateDocumentsOutput:
         return self._fetch_from_gitlab()

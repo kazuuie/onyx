@@ -2,15 +2,10 @@ import json
 from collections.abc import Generator
 
 from ee.onyx.external_permissions.gitlab.utils import (
-    GitLabVisibility,
     get_external_access_permission,
-    get_project_visibility,
 )
 from ee.onyx.external_permissions.perm_sync_types import FetchAllDocumentsFunction, FetchAllDocumentsIdsFunction
-from gitlab.v4.objects import Project
 from onyx.access.models import DocExternalAccess
-from onyx.access.utils import build_ext_group_name_for_onyx
-from onyx.configs.constants import DocumentSource
 from onyx.connectors.gitlab.connector import DocMetadata, GitlabConnector
 from onyx.db.models import ConnectorCredentialPair
 from onyx.db.utils import DocumentRow, SortOrder
@@ -50,7 +45,7 @@ def gitlab_doc_sync(
     # Get all repositories from gitlab API
     logger.info("Fetching all repositories from GitLab API")
     try:
-        projects = gitlab_connector.fetch_configured_projects()
+        projects = gitlab_connector._fetch_configured_projects()
         logger.info(f"Found {len(projects)} projects to check")
     except Exception as e:
         logger.error(f"Failed to fetch repositories: {e}")
@@ -79,61 +74,29 @@ def gitlab_doc_sync(
                 logger.warning(f"No documents found for repository {project.id} ({project.path_with_namespace})")
                 continue
 
-            current_external_group_ids = project_doc_list[0].external_user_group_ids or []
+            expected_external_access = get_external_access_permission(project, add_prefix=True)
 
-            # Check if repository has any permission changes
-            has_changes = _check_project_for_changes(
-                project=project,
-                current_external_group_ids=current_external_group_ids,
-            )
+            updates_yielded = 0
 
-            if has_changes:
-                logger.info(f"Repository {project.id} ({project.path_with_namespace}) has changes, updating documents")
+            for doc in project_doc_list:
+                current_group_ids = set(doc.external_user_group_ids or [])
+                expected_group_ids = expected_external_access.external_user_group_ids
 
-                # Get new external access permissions for this repository
-                new_external_access = get_external_access_permission(project)
+                needs_update = current_group_ids != expected_group_ids or doc.is_public != expected_external_access.is_public
 
-                # Yield updated external access for each document
-                for doc in project_doc_list:
+                if needs_update:
                     if callback:
                         callback.progress(GITLAB_DOC_SYNC_LABEL, 1)
 
                     yield DocExternalAccess(
                         doc_id=doc.id,
-                        external_access=new_external_access,
+                        external_access=expected_external_access,
                     )
-            else:
-                logger.info(f"Repository {project.id} ({project.path_with_namespace}) has no changes, skipping")
+                    updates_yielded += 1
+            if updates_yielded > 0:
+                logger.info(f"Updated permissions for {updates_yielded} documents in {project.path_with_namespace}")
+
         except Exception as e:
             logger.error(f"Error processing repository {project.id} ({project.path_with_namespace}): {e}")
 
     logger.info(f"GitLab document sync completed for CC pair ID: {cc_pair.id}")
-
-
-def _check_project_for_changes(
-    project: Project,
-    current_external_group_ids: list[str],
-) -> bool:
-    current_visibility = get_project_visibility(project)
-
-    # 1. Infer changes based on visibility
-    is_public_currently = current_visibility in (GitLabVisibility.PUBLIC, GitLabVisibility.INTERNAL)
-    was_public_previously = len(current_external_group_ids) == 0  # Simplified logic to determine previous state
-
-    if is_public_currently != was_public_previously:
-        return True
-
-    if is_public_currently:
-        return False  # No change needed if it was public before and is still public
-
-    # 2. Check for group configuration changes
-    # Simulate the group IDs that should currently be set
-    expected_group_ids = set()
-    proj_group_id = build_ext_group_name_for_onyx(DocumentSource.GITLAB, f"project_{project.id}_members")
-    expected_group_ids.add(proj_group_id)
-
-    # Compare with the existing group IDs from the database
-    current_group_ids_set = set(current_external_group_ids)
-
-    # If there is a difference, an update is required
-    return expected_group_ids != current_group_ids_set
