@@ -82,13 +82,13 @@ def _convert_issue_to_document(
     return Document(
         id=issue.web_url,
         sections=[TextSection(link=issue.web_url, text=issue.description or "")],
+        source=DocumentSource.GITLAB,
         semantic_identifier=issue.title,
         # updated_at is UTC time but is timezone unaware, explicitly add UTC
         # as there is logic in indexing to prevent wrong timestamped docs
         # due to local time discrepancies with UTC
         doc_updated_at=issue.updated_at.replace(tzinfo=timezone.utc),
         primary_owners=[get_author(issue.author)],
-        source=DocumentSource.GITLAB,
         external_access=get_external_access_permission(project=project, add_prefix=add_prefix),
         metadata={
             "connector_id": "gitlab",
@@ -105,6 +105,7 @@ def _convert_code_to_document(
     file: dict,
     add_prefix: bool = True,
 ) -> Document:
+    # Dynamically get the default branch from the project object
     default_branch = project.default_branch
     file_content_obj = project.files.get(file_path=file["path"], ref=default_branch)
 
