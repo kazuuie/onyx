@@ -32,7 +32,7 @@ exclude_patterns = [
 
 
 class DocMetadata(BaseModel):
-    repo: str  # プロジェクトの path_with_namespace (例: "group/project")
+    repo: str  # Project's path_with_namespace (e.g., "group/project")
     project_id: int
     type: str  # "issue", "merge_request", "file"
 

@@ -31,7 +31,7 @@ def _run_with_retry(
     description: str,
     retry_count: int = 3,
 ) -> Optional[T]:
-    """GitLab API操作の簡易的なリトライロジック"""
+    """Simple retry logic for GitLab API operations."""
     for i in range(retry_count):
         try:
             return operation()
@@ -53,7 +53,7 @@ def get_project_visibility(project: Project) -> GitLabVisibility:
 
 def get_external_access_permission(project: Project, add_prefix: bool = False) -> ExternalAccess:
     """
-    GitLabプロジェクトの権限情報をOnyxのExternalAccess形式に変換します。
+    Converts GitLab project permissions into Onyx's ExternalAccess format.
     """
     project_visibility = get_project_visibility(project)
 
@@ -75,27 +75,39 @@ def get_external_access_permission(project: Project, add_prefix: bool = False) -
     )
 
 
-def get_project_members_emails(project: Project, gitlab_client: gitlab.Gitlab) -> list[str]:
+def get_project_members_emails(project: Project, gitlab_client: gitlab.Gitlab, user_email_cache: dict[int, str]) -> list[str]:
     """
-    プロジェクトにアクセス可能な全ユーザーのメールアドレスを取得。
-    members_all.list(all=True) を使うことで、継承された権限もカバーする。
+    Retrieves the email addresses of all users with access to the project.
+    Uses members_all.list(get_all=True) to cover inherited permissions.
     """
-    # read_api 権限が強ければ、ここで全メンバーのリストが取得可能
     members = project.members_all.list(get_all=True)
     emails: set[str] = set()
 
     for m in members:
         try:
-            # 1. 直接的な email 属性（Admin/本人なら見える）
-            # 2. public_email（ユーザーが公開設定にしている場合）
-            user = gitlab_client.users.get(m.id)
-            email = getattr(m, "email", None) or getattr(user, "public_email", None)
+            # 1. Direct email attribute (visible to Admins/Users themselves)
+            # 2. public_email (if the user has made it public)
+            # Note: Fetching user details individually might cause an N+1 issue on large instances.
+            # However, this is currently necessary to ensure we retrieve the primary email reliably
+            # using the Admin token across self-hosted environments.
+
+            if m.id in user_email_cache:
+                email = user_email_cache[m.id]
+                if email:
+                    emails.add(email)
+                continue
+
+            email = getattr(m, "email", None)
+            if not email:
+                user = gitlab_client.users.get(m.id)
+                email = getattr(user, "email", None) or getattr(user, "public_email", None)
+
+            user_email_cache[m.id] = email or ""
 
             if email:
                 emails.add(email)
             else:
-                # フォールバック: username が判明しているなら、
-                # Onyx側のユーザー管理ルールに合わせて生成するか、警告を出す
+                # Fallback warning if email is not visible.
                 logger.warning(f"User {m.username} (ID: {m.id}) has no email visible. Sync might fail for this user.")
         except Exception as e:
             logger.error(f"Failed to fetch user {m.username} (ID: {m.id}): {e}")
@@ -103,18 +115,20 @@ def get_project_members_emails(project: Project, gitlab_client: gitlab.Gitlab) -
     return list(emails)
 
 
-def get_external_user_groups(project: Project, gitlab_client: gitlab.Gitlab) -> list[ExternalUserGroup]:
+def get_external_user_groups(
+    project: Project, gitlab_client: gitlab.Gitlab, user_email_cache: dict[int, str]
+) -> list[ExternalUserGroup]:
     """
-    Onyxの Permission Sync で使用。
-    'project_{id}_members' という Onyx 内のグループに誰が属するかを定義。
+    Used in Onyx's Permission Sync.
+    Defines who belongs to the Onyx group named 'project_{id}_members'.
     """
     emails = _run_with_retry(
-        lambda: get_project_members_emails(project, gitlab_client), f"fetching members for project {project.id}"
+        lambda: get_project_members_emails(project, gitlab_client, user_email_cache), f"fetching members for project {project.id}"
     )
     if not emails:
         return []
 
-    # Onyxが認識できるグループIDの形式に変換
+    # Convert to the group ID format recognized by Onyx
     group_name = f"project_{project.id}_members"
 
     return [ExternalUserGroup(id=group_name, user_emails=emails)]

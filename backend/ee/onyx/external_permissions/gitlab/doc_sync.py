@@ -19,7 +19,7 @@ from onyx.utils.logger import setup_logger
 
 logger = setup_logger()
 
-gitlab_DOC_SYNC_LABEL = "gitlab_doc_sync"
+GITLAB_DOC_SYNC_LABEL = "gitlab_doc_sync"
 
 
 def gitlab_doc_sync(
@@ -34,21 +34,21 @@ def gitlab_doc_sync(
     This function checks each repository for visibility/team changes and updates
     document permissions accordingly without using checkpoints.
     """
-    logger.info(f"Starting gitlab document sync for CC pair ID: {cc_pair.id}")
+    logger.info(f"Starting GitLab document sync for CC pair ID: {cc_pair.id}")
 
     # Initialize gitlab connector with credentials
     gitlab_connector: GitlabConnector = GitlabConnector(**cc_pair.connector.connector_specific_config)
 
     credential_json = cc_pair.credential.credential_json.get_value(apply_mask=False) if cc_pair.credential.credential_json else {}
     gitlab_connector.load_credentials(credential_json)
-    logger.info("gitlab connector credentials loaded successfully")
+    logger.info("GitLab connector credentials loaded successfully")
 
     if not gitlab_connector.gitlab_client:
-        logger.error("gitlab client initialization failed")
+        logger.error("GitLab client initialization failed")
         raise ValueError("gitlab_client is required")
 
     # Get all repositories from gitlab API
-    logger.info("Fetching all repositories from gitlab API")
+    logger.info("Fetching all repositories from GitLab API")
     try:
         projects = gitlab_connector.fetch_configured_projects()
         logger.info(f"Found {len(projects)} projects to check")
@@ -69,7 +69,7 @@ def gitlab_doc_sync(
         except Exception as e:
             logger.error(f"Failed to parse doc metadata: {e} for doc {doc.id}")
             continue
-    logger.info(f"Found {len(project_to_doc_list_map)} documents to check")
+    logger.info(f"Found {len(project_to_doc_list_map)} unique repositories in existing documents")
     # Process each repository individually
     for project in projects:
         try:
@@ -80,10 +80,10 @@ def gitlab_doc_sync(
                 continue
 
             current_external_group_ids = project_doc_list[0].external_user_group_ids or []
+
             # Check if repository has any permission changes
             has_changes = _check_project_for_changes(
                 project=project,
-                gitlab_client=gitlab_connector.gitlab_client,
                 current_external_group_ids=current_external_group_ids,
             )
 
@@ -93,12 +93,10 @@ def gitlab_doc_sync(
                 # Get new external access permissions for this repository
                 new_external_access = get_external_access_permission(project)
 
-                logger.info(f"Found {len(project_doc_list)} documents for repository {project.path_with_namespace}")
-
                 # Yield updated external access for each document
                 for doc in project_doc_list:
                     if callback:
-                        callback.progress(gitlab_DOC_SYNC_LABEL, 1)
+                        callback.progress(GITLAB_DOC_SYNC_LABEL, 1)
 
                     yield DocExternalAccess(
                         doc_id=doc.id,
@@ -109,7 +107,7 @@ def gitlab_doc_sync(
         except Exception as e:
             logger.error(f"Error processing repository {project.id} ({project.path_with_namespace}): {e}")
 
-    logger.info(f"gitlab document sync completed for CC pair ID: {cc_pair.id}")
+    logger.info(f"GitLab document sync completed for CC pair ID: {cc_pair.id}")
 
 
 def _check_project_for_changes(
@@ -118,24 +116,24 @@ def _check_project_for_changes(
 ) -> bool:
     current_visibility = get_project_visibility(project)
 
-    # 1. 可視性による推測
+    # 1. Infer changes based on visibility
     is_public_currently = current_visibility in (GitLabVisibility.PUBLIC, GitLabVisibility.INTERNAL)
-    was_public_previously = len(current_external_group_ids) == 0  # 簡略化した判定
+    was_public_previously = len(current_external_group_ids) == 0  # Simplified logic to determine previous state
 
     if is_public_currently != was_public_previously:
         return True
 
     if is_public_currently:
-        return False  # 以前も今もPublicなら変更なし
+        return False  # No change needed if it was public before and is still public
 
-    # 2. グループ構成の変更チェック
-    # 現在設定されるべきグループIDをシミュレート
+    # 2. Check for group configuration changes
+    # Simulate the group IDs that should currently be set
     expected_group_ids = set()
     proj_group_id = build_ext_group_name_for_onyx(DocumentSource.GITLAB, f"project_{project.id}_members")
     expected_group_ids.add(proj_group_id)
 
-    # 既存のDBのグループIDセットと比較
+    # Compare with the existing group IDs from the database
     current_group_ids_set = set(current_external_group_ids)
 
-    # 差分があれば更新が必要
+    # If there is a difference, an update is required
     return expected_group_ids != current_group_ids_set
