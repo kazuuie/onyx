@@ -91,7 +91,7 @@ def gitlab_doc_sync(
                 logger.info(f"Repository {project.id} ({project.path_with_namespace}) has changes, updating documents")
 
                 # Get new external access permissions for this repository
-                new_external_access = get_external_access_permission(project, gitlab_connector.gitlab_client)
+                new_external_access = get_external_access_permission(project)
 
                 logger.info(f"Found {len(project_doc_list)} documents for repository {project.path_with_namespace}")
 
@@ -119,7 +119,7 @@ def _check_project_for_changes(
     current_visibility = get_project_visibility(project)
 
     # 1. 可視性による推測
-    is_public_currently = current_visibility == GitLabVisibility.PUBLIC
+    is_public_currently = current_visibility in (GitLabVisibility.PUBLIC, GitLabVisibility.INTERNAL)
     was_public_previously = len(current_external_group_ids) == 0  # 簡略化した判定
 
     if is_public_currently != was_public_previously:
@@ -133,10 +133,6 @@ def _check_project_for_changes(
     expected_group_ids = set()
     proj_group_id = build_ext_group_name_for_onyx(DocumentSource.GITLAB, f"project_{project.id}_members")
     expected_group_ids.add(proj_group_id)
-
-    if project.namespace["kind"] == "group":
-        ns_group_id = build_ext_group_name_for_onyx(DocumentSource.GITLAB, f"group_{project.namespace['id']}")
-        expected_group_ids.add(ns_group_id)
 
     # 既存のDBのグループIDセットと比較
     current_group_ids_set = set(current_external_group_ids)

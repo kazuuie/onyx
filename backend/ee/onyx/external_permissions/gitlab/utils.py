@@ -51,7 +51,7 @@ def get_project_visibility(project: Project) -> GitLabVisibility:
     return GitLabVisibility.PRIVATE
 
 
-def get_external_access_permission(project: Project, gitlab_client: gitlab.Gitlab, add_prefix: bool = False) -> ExternalAccess:
+def get_external_access_permission(project: Project, add_prefix: bool = False) -> ExternalAccess:
     """
     GitLabプロジェクトの権限情報をOnyxのExternalAccess形式に変換します。
     """
@@ -64,40 +64,18 @@ def get_external_access_permission(project: Project, gitlab_client: gitlab.Gitla
             is_public=True,
         )
 
-    group_ids: set[str] = set()
-    # 1. プロジェクト固有のグループID (直接メンバー用)
     project_group_id = f"project_{project.id}_members"
     if add_prefix:
         project_group_id = build_ext_group_name_for_onyx(source=DocumentSource.GITLAB, ext_group_name=project_group_id)
 
-    group_ids.add(project_group_id)
-
-    # 2. 親グループ (Namespace) のグループID
-    # GitLabプロジェクトがグループに属している場合、そのグループIDも追加する
-    if project.namespace["kind"] == "group":
-        try:
-            # ここで gitlab_client を使用してグループ詳細を取得する
-            group_obj = _run_with_retry(
-                lambda: gitlab_client.groups.get(project.namespace["id"]), f"fetch group {project.namespace['id']}"
-            )
-            # 親グループ、さらにその親（先祖）すべてのグループIDを収集
-            # ※GitLabは階層構造のため、上位グループのメンバーも閲覧権限がある
-            ns_group_id = f"group_{group_obj.id}"
-            if add_prefix:
-                ns_group_id = build_ext_group_name_for_onyx(source=DocumentSource.GITLAB, ext_group_name=ns_group_id)
-            group_ids.add(ns_group_id)
-
-        except Exception as e:
-            logger.error(f"Failed to fetch group info for namespace {project.namespace['id']}: {e}")
-
     return ExternalAccess(
         external_user_emails=set(),
-        external_user_group_ids=group_ids,
+        external_user_group_ids={project_group_id},
         is_public=False,
     )
 
 
-def get_project_members_emails(project: Project) -> list[str]:
+def get_project_members_emails(project: Project, gitlab_client: gitlab.Gitlab) -> list[str]:
     """
     プロジェクトにアクセス可能な全ユーザーのメールアドレスを取得。
     members_all.list(all=True) を使うことで、継承された権限もカバーする。
@@ -107,26 +85,32 @@ def get_project_members_emails(project: Project) -> list[str]:
     emails: set[str] = set()
 
     for m in members:
-        # 1. 直接的な email 属性（Admin/本人なら見える）
-        # 2. public_email（ユーザーが公開設定にしている場合）
-        email = getattr(m, "email", None) or getattr(m, "public_email", None)
+        try:
+            # 1. 直接的な email 属性（Admin/本人なら見える）
+            # 2. public_email（ユーザーが公開設定にしている場合）
+            user = gitlab_client.users.get(m.id)
+            email = getattr(m, "email", None) or getattr(user, "public_email", None)
 
-        if email:
-            emails.add(email)
-        else:
-            # フォールバック: username が判明しているなら、
-            # Onyx側のユーザー管理ルールに合わせて生成するか、警告を出す
-            logger.warning(f"User {m.username} (ID: {m.id}) has no email visible. Sync might fail for this user.")
+            if email:
+                emails.add(email)
+            else:
+                # フォールバック: username が判明しているなら、
+                # Onyx側のユーザー管理ルールに合わせて生成するか、警告を出す
+                logger.warning(f"User {m.username} (ID: {m.id}) has no email visible. Sync might fail for this user.")
+        except Exception as e:
+            logger.error(f"Failed to fetch user {m.username} (ID: {m.id}): {e}")
 
     return list(emails)
 
 
-def get_external_user_groups(project: Project) -> list[ExternalUserGroup]:
+def get_external_user_groups(project: Project, gitlab_client: gitlab.Gitlab) -> list[ExternalUserGroup]:
     """
     Onyxの Permission Sync で使用。
     'project_{id}_members' という Onyx 内のグループに誰が属するかを定義。
     """
-    emails = _run_with_retry(lambda: get_project_members_emails(project), f"fetching members for project {project.id}")
+    emails = _run_with_retry(
+        lambda: get_project_members_emails(project, gitlab_client), f"fetching members for project {project.id}"
+    )
     if not emails:
         return []
 

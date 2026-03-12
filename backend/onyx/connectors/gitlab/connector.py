@@ -7,6 +7,7 @@ from typing import Any, TypeVar
 
 import gitlab
 import pytz
+from ee.onyx.external_permissions.gitlab.utils import get_external_access_permission
 from gitlab.v4.objects import Project
 from pydantic import BaseModel
 
@@ -31,11 +32,6 @@ exclude_patterns = [
 
 
 class DocMetadata(BaseModel):
-    """
-    ドキュメントの出所を特定するためのメタデータ。
-    doc_sync.py で既存ドキュメントをプロジェクトごとに分類するために使用します。
-    """
-
     repo: str  # プロジェクトの path_with_namespace (例: "group/project")
     project_id: int
     type: str  # "issue", "merge_request", "file"
@@ -78,52 +74,37 @@ def _convert_issue_to_document(issue: Any, project: Project) -> Document:
         sections=[TextSection(text=issue.description or "", link=issue.web_url)],
         source=DocumentSource.GITLAB,
         metadata={
-            "connector_id": "gitlab",  # 既存のメタデータ
-            # 追加: doc_sync 用のメタデータ
+            "connector_id": "gitlab",
             "repo": project.path_with_namespace,
             "project_id": project.id,
             "type": "issue",
         },
-        # ...その他のフィールド
     )
 
 
-def _convert_file_to_document(file_path: str, content: str, project: Project) -> Document:
-    return Document(
-        id=f"gitlab_file_{project.id}_{file_path}",
-        sections=[TextSection(text=content, link=f"{project.web_url}/blob/main/{file_path}")],
-        source=DocumentSource.GITLAB,
-        metadata={"repo": project.path_with_namespace, "project_id": project.id, "type": "file"},
-        # ...
-    )
-
-
-def _convert_code_to_document(project: Project, file: Any, url: str, projectName: str, projectOwner: str) -> Document:
-    # Dynamically get the default branch from the project object
+def _convert_code_to_document(
+    project: Project,
+    file: dict,
+    add_prefix: bool = True,
+) -> Document:
     default_branch = project.default_branch
+    file_content_obj = project.files.get(file_path=file["path"], ref=default_branch)
 
-    # Fetch the file content using the correct branch
-    file_content_obj = project.files.get(
-        file_path=file["path"],
-        ref=default_branch,  # Use the default branch
-    )
     try:
         file_content = file_content_obj.decode().decode("utf-8")
     except UnicodeDecodeError:
         file_content = file_content_obj.decode().decode("latin-1")
 
-    # Construct the file URL dynamically using the default branch
-    file_url = f"{url}/{projectOwner}/{projectName}/-/blob/{default_branch}/{file['path']}"
+    external_access = get_external_access_permission(project=project, add_prefix=add_prefix)
 
-    # Create and return a Document object
     return Document(
-        id=file["id"],
-        sections=[TextSection(link=file_url, text=file_content)],
+        id=f"gitlab_{project.id}_{file['path']}",
+        sections=[TextSection(text=file_content, link=f"{project.web_url}/-/blob/{default_branch}/{file['path']}")],
         source=DocumentSource.GITLAB,
         semantic_identifier=file["name"],
-        doc_updated_at=datetime.now().replace(tzinfo=timezone.utc),
-        primary_owners=[],  # Add owners if needed
-        metadata={"type": "CodeFile"},
+        metadata={"repo": project.path_with_namespace, "project_id": project.id, "type": "CodeFile"},
+        external_access=external_access,
+        doc_updated_at=datetime.now(timezone.utc),
     )
 
 
@@ -157,17 +138,12 @@ class GitlabConnector(LoadConnector, PollConnector):
         return None
 
     def _fetch_configured_projects(self) -> list[Project]:
-        """
-        設定された owner/name に基づいて GitLab Project オブジェクトのリストを返します。
-        """
         if not self.gitlab_client:
             return []
 
-        # 既存の _fetch_from_gitlab 内のロジックを流用
         if self.project_name:
             return [self.gitlab_client.projects.get(f"{self.project_owner}/{self.project_name}")]
         else:
-            # ownerがユーザーかグループかによって取得方法を分ける
             try:
                 group = self.gitlab_client.groups.get(self.project_owner)
                 return group.projects.list(get_all=True)
