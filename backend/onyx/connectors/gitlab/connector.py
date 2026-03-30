@@ -33,7 +33,7 @@ exclude_patterns = [
 
 class DocMetadata(BaseModel):
     repo: str  # Project's path_with_namespace (e.g., "group/project")
-    project_id: int
+    project_id: str
     type: str  # "issue", "merge_request", "file"
 
 
@@ -93,7 +93,7 @@ def _convert_issue_to_document(
         metadata={
             "connector_id": "gitlab",
             "repo": project.path_with_namespace,
-            "project_id": project.id,
+            "project_id": str(project.id),
             "type": issue.type if issue.type else "Issue",
             "state": issue.state,
         },
@@ -119,7 +119,7 @@ def _convert_code_to_document(
         sections=[TextSection(text=file_content, link=f"{project.web_url}/-/blob/{default_branch}/{file['path']}")],
         source=DocumentSource.GITLAB,
         semantic_identifier=file["name"],
-        metadata={"repo": project.path_with_namespace, "project_id": project.id, "type": "CodeFile"},
+        metadata={"repo": project.path_with_namespace, "project_id": str(project.id), "type": "CodeFile"},
         external_access=get_external_access_permission(project=project, add_prefix=add_prefix),
         doc_updated_at=datetime.now().replace(tzinfo=timezone.utc),
     )

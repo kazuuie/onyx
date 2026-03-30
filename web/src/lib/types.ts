@@ -542,6 +542,7 @@ export const validAutoSyncSources = [
   ValidSources.Slack,
   ValidSources.Salesforce,
   ValidSources.GitHub,
+  ValidSources.GitLab,
   ValidSources.Sharepoint,
   ValidSources.Teams,
 ] as const;
