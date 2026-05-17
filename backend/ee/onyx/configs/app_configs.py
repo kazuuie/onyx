@@ -67,6 +67,18 @@ GITHUB_PERMISSION_GROUP_SYNC_FREQUENCY = int(
     os.environ.get("GITHUB_PERMISSION_GROUP_SYNC_FREQUENCY") or 5 * 60
 )
 
+#####
+# GitLab
+#####
+# In seconds, default is 5 minutes
+GITLAB_PERMISSION_DOC_SYNC_FREQUENCY = int(
+    os.environ.get("GITLAB_PERMISSION_DOC_SYNC_FREQUENCY") or 5 * 60
+)
+# In seconds, default is 5 minutes
+GITLAB_PERMISSION_GROUP_SYNC_FREQUENCY = int(
+    os.environ.get("GITLAB_PERMISSION_GROUP_SYNC_FREQUENCY") or 5 * 60
+)
+
 
 #####
 # Slack
